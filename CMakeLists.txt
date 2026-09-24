@@ -24,7 +24,7 @@ add_library(monitor_core
 )
 target_include_directories(monitor_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_definitions(monitor_core PUBLIC UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
-target_link_libraries(monitor_core PUBLIC psapi shell32 ole32 user32)
+target_link_libraries(monitor_core PUBLIC psapi shell32 ole32 user32 version dwmapi)
 
 add_executable(untitled7 WIN32
     src/app/main.cpp

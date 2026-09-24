@@ -20,6 +20,9 @@ struct ProcessData {
     Reading<double> cpu;
     std::shared_ptr<const ProcessIcon> icon;
     std::wstring executable;
+    std::wstring displayName;
+    std::uint32_t parentId{};
+    bool application{};
 };
 struct ProcessList {
     std::vector<ProcessData> rows;
@@ -30,6 +33,10 @@ public:
     ProcessList sample();
     void reset() { cpu_.clear(); }
 private:
+    struct Appearance {
+        std::shared_ptr<const ProcessIcon> icon;
+        std::wstring name;
+    };
     std::map<std::uint32_t, ProcessCpuSampler> cpu_;
-    std::map<std::wstring, std::shared_ptr<const ProcessIcon>> icons_;
+    std::map<std::wstring, Appearance> icons_;
 };

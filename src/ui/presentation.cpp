@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <locale>
 #include <sstream>
+#include <set>
 
 namespace {
 int compareText(const std::wstring& a, const std::wstring& b) {
@@ -62,26 +63,69 @@ std::array<std::wstring, 5> cells(const ProcessData& process) {
 bool sameProcess(const ProcessData& a, const ProcessData& b) {
     return a.processId == b.processId && a.creationTime == b.creationTime && a.name == b.name;
 }
-std::vector<ProcessTableRow> groupedRows(std::span<const ProcessData> processes, SortColumn column,
-    bool ascending, const std::map<std::wstring, bool>& expansion, bool searching) {
-    std::map<std::wstring, std::vector<ProcessData>> families;
-    for (const auto& process : processes) {
+ProcessTable processTable(std::span<const ProcessData> processes, const std::wstring& filter, SortColumn column,
+    bool ascending, const std::map<std::wstring, bool>& expansion) {
+    const auto executableKey = [](const ProcessData& process) {
         std::wstring key = process.executable;
         if (!key.empty()) {
             std::wstring normalized(key.size(), L'\0');
             if (LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, key.data(), static_cast<int>(key.size()),
                 normalized.data(), static_cast<int>(normalized.size()), nullptr, nullptr, 0)) key = std::move(normalized);
         } else key = L"pid:" + std::to_wstring(process.processId) + L":" + std::to_wstring(process.creationTime);
-        families[key].push_back(process);
+        return key;
+    };
+    std::map<std::uint32_t, const ProcessData*> byId;
+    std::map<std::wstring, const ProcessData*> apps;
+    for (const auto& process : processes) {
+        byId[process.processId] = &process;
+        if (process.application) apps.try_emplace(executableKey(process), &process);
     }
     struct Family { ProcessTableRow row; std::vector<ProcessData> members; };
+    std::map<std::wstring, Family> families;
+    for (const auto& process : processes) {
+        const ProcessData* root = &process;
+        const ProcessData* ancestor = &process;
+        bool application = false;
+        std::set<std::uint32_t> visited;
+        while (ancestor && visited.insert(ancestor->processId).second) {
+            const auto app = apps.find(executableKey(*ancestor));
+            if (app != apps.end()) {
+                if (ancestor == &process || compareText(app->second->name, L"explorer.exe") != 0) {
+                    root = app->second; application = true;
+                }
+                break;
+            }
+            const auto parent = byId.find(ancestor->parentId);
+            if (parent == byId.end() || !ancestor->creationTime || !parent->second->creationTime ||
+                parent->second->creationTime > ancestor->creationTime) break;
+            ancestor = parent->second;
+        }
+        const auto key = executableKey(*root);
+        auto& family = families[key];
+        if (family.members.empty()) {
+            family.row.family = key;
+            family.row.process = *root;
+            family.row.application = application;
+        }
+        family.members.push_back(process);
+    }
     std::vector<Family> groups;
-    for (auto& [key, members] : families) {
+    const auto matches = [&](const std::wstring& value) {
+        return filter.empty() || (!value.empty() && FindStringOrdinal(FIND_FROMSTART,value.c_str(),-1,filter.c_str(),-1,TRUE)>=0);
+    };
+    for (auto& [key, family] : families) {
+        auto& row = family.row;
+        auto& members = family.members;
+        if (!matches(row.process.displayName) && !matches(row.process.name) &&
+            std::none_of(members.begin(),members.end(),[&](const auto& p) {
+                return matches(p.name) || matches(p.displayName) || matches(std::to_wstring(p.processId));
+            })) continue;
         std::sort(members.begin(), members.end(), [&](const auto& a, const auto& b) { return processLess(a,b,column,ascending); });
-        ProcessTableRow row; row.family = key; row.process = members.front(); row.count = members.size();
-        row.header = members.size() > 1;
+        row.count = members.size();
+        row.header = row.application || members.size() > 1;
         const auto state = expansion.find(key);
-        row.expanded = state == expansion.end() ? searching : state->second;
+        row.expanded = state == expansion.end() ? !filter.empty() : state->second;
+        if (!row.process.displayName.empty()) row.process.name = row.process.displayName;
         if (row.header) {
             row.key = L"group:" + key;
             const auto total = [&]<class T>(Reading<T> ProcessData::* field, bool maximum = false) {
@@ -99,19 +143,31 @@ std::vector<ProcessTableRow> groupedRows(std::span<const ProcessData> processes,
             row.process.memoryBytes = total(&ProcessData::memoryBytes);
             row.process.uptimeSec = total(&ProcessData::uptimeSec, true);
         } else row.key = L"process:" + std::to_wstring(row.process.processId) + L":" + std::to_wstring(row.process.creationTime);
-        groups.push_back({std::move(row), std::move(members)});
+        groups.push_back(std::move(family));
     }
     std::stable_sort(groups.begin(), groups.end(), [&](const auto& a, const auto& b) {
+        if (a.row.application != b.row.application) return a.row.application;
         return processLess(a.row.process,b.row.process,column,ascending);
     });
-    std::vector<ProcessTableRow> result;
-    for (auto& group : groups) {
-        result.push_back(group.row);
-        if (group.row.header && group.row.expanded) for (auto& process : group.members) {
-            ProcessTableRow child;
-            child.family = group.row.family; child.child = true;
-            child.key = L"process:" + std::to_wstring(process.processId) + L":" + std::to_wstring(process.creationTime);
-            child.process = std::move(process); result.push_back(std::move(child));
+    ProcessTable result;
+    for (const bool application : {true, false}) {
+        const auto count = std::count_if(groups.begin(), groups.end(), [&](const auto& g) { return g.row.application == application; });
+        if (!count) continue;
+        ProcessTableRow section; section.section = true;
+        section.key = application ? L"apps" : L"background";
+        section.process.name = (application ? L"Apps (" : L"Background processes (") + std::to_wstring(count) + L")";
+        result.rows.push_back(std::move(section));
+        for (auto& group : groups) if (group.row.application == application) {
+            result.rows.push_back(group.row);
+            for (const auto& process : group.members) {
+                result.processes.push_back(process);
+                if (group.row.header && group.row.expanded) {
+                    ProcessTableRow child;
+                    child.family = group.row.family; child.child = true;
+                    child.key = L"process:" + std::to_wstring(process.processId) + L":" + std::to_wstring(process.creationTime);
+                    child.process = process; result.rows.push_back(std::move(child));
+                }
+            }
         }
     }
     return result;

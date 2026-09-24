@@ -97,7 +97,7 @@ void updateIcons(App& app) {
     app.rowIcons.assign(app.rows.size(), 0);
     if (app.settings.view != 1) return;
     const int size = app.px(16);
-    app.processIcons = ImageList_Create(size, size, ILC_COLOR32 | ILC_MASK, 16, 16);
+    app.processIcons = ImageList_Create(size, app.px(24), ILC_COLOR32 | ILC_MASK, 16, 16);
     if (!app.processIcons) return;
     ImageList_AddIcon(app.processIcons, LoadIconW(nullptr, IDI_APPLICATION));
     std::map<const ProcessIcon*, int> indices;
@@ -119,7 +119,7 @@ void columns(App& app) {
     ListView_SetItemCount(app.table, 0);
     while (Header_GetItemCount(ListView_GetHeader(app.table)) > 0) ListView_DeleteColumn(app.table, 0);
     std::vector<std::pair<const wchar_t*, int>> fields;
-    if (app.settings.view == 1) fields = {{L"Process",app.settings.columns[0]}, {L"PID",app.settings.columns[1]}, {L"CPU (%)",app.settings.columns[2]},
+    if (app.settings.view == 1) fields = {{L"Name",app.settings.columns[0]}, {L"PID",app.settings.columns[1]}, {L"CPU (%)",app.settings.columns[2]},
         {L"Working set (MiB)",app.settings.columns[3]}, {L"Uptime",app.settings.columns[4]}};
     if (app.settings.view == 2) fields = {{L"Simulated sensor",160}, {L"Units",65}, {L"Current",130}, {L"Average",100},
         {L"Minimum",100}, {L"Maximum",100}, {L"Valid/window",110}, {L"Threshold state",145}, {L"Transitions",95}};
@@ -148,20 +148,20 @@ void rebuild(App& app) {
     app.textRows.clear();
     if (app.settings.view == 1) {
         const auto& processes = app.latest.processes;
-        if (processes.data)
-            app.filteredRows = makeRows(processes.data->rows, windowText(app.search), static_cast<SortColumn>(app.settings.sortColumn), app.settings.ascending);
-        else app.filteredRows.clear();
-        app.processRows = groupedRows(app.filteredRows, static_cast<SortColumn>(app.settings.sortColumn),
-            app.settings.ascending, app.expansion, !windowText(app.search).empty());
+        ProcessTable table;
+        if (processes.data) table = processTable(processes.data->rows, windowText(app.search),
+            static_cast<SortColumn>(app.settings.sortColumn), app.settings.ascending, app.expansion);
+        app.filteredRows = std::move(table.processes);
+        app.processRows = std::move(table.rows);
         app.rows.clear();
         for (const auto& row : app.processRows) {
             app.rows.push_back(row.process);
             auto rowCells = cells(row.process);
             if (row.header) {
-                rowCells[0] = (row.expanded ? L"\u25bc " : L"\u25b6 ") + row.process.name + L" (" + std::to_wstring(row.count) + L")";
+                if (row.count > 1) rowCells[0] += L" (" + std::to_wstring(row.count) + L")";
                 rowCells[1] = L"";
             }
-            if (row.child) rowCells[0] = L"      " + rowCells[0];
+            if (row.section) for (std::size_t i = 1; i < rowCells.size(); ++i) rowCells[i].clear();
             app.textRows.emplace_back(rowCells.begin(), rowCells.end());
         }
         HWND header = ListView_GetHeader(app.table);
@@ -228,6 +228,27 @@ void expandProcess(App& app, int index, std::optional<bool> expanded = {}) {
 }
 LRESULT CALLBACK processKeys(HWND window, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR, DWORD_PTR reference) {
     auto& app = *reinterpret_cast<App*>(reference);
+    if (app.settings.view == 1 && message == WM_LBUTTONDOWN) {
+        LVHITTESTINFO hit{};
+        hit.pt = {static_cast<short>(LOWORD(lParam)), static_cast<short>(HIWORD(lParam))};
+        const int index = ListView_HitTest(window, &hit);
+        if (index >= 0 && index < static_cast<int>(app.processRows.size()) && app.processRows[index].section) return 0;
+    }
+    if (app.settings.view == 1 && message == WM_KEYDOWN &&
+        (wParam == VK_UP || wParam == VK_DOWN || wParam == VK_HOME || wParam == VK_END)) {
+        const int size = static_cast<int>(app.processRows.size());
+        const int direction = wParam == VK_UP || wParam == VK_END ? -1 : 1;
+        int index = ListView_GetNextItem(window, -1, LVNI_SELECTED);
+        if (wParam == VK_HOME || wParam == VK_END || index < 0) index = direction > 0 ? 0 : size - 1;
+        else index += direction;
+        while (index >= 0 && index < size && app.processRows[index].section) index += direction;
+        if (index >= 0 && index < size) {
+            ListView_SetItemState(window, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+            ListView_SetItemState(window, index, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+            ListView_EnsureVisible(window, index, FALSE);
+        }
+        return 0;
+    }
     if (message == WM_KEYDOWN && app.settings.view == 1 &&
         (wParam == VK_LEFT || wParam == VK_RIGHT || wParam == VK_SPACE || wParam == VK_RETURN)) {
         const int index = ListView_GetNextItem(window, -1, LVNI_SELECTED);
@@ -236,6 +257,46 @@ LRESULT CALLBACK processKeys(HWND window, UINT message, WPARAM wParam, LPARAM lP
         return 0;
     }
     return DefSubclassProc(window, message, wParam, lParam);
+}
+LRESULT drawProcess(App& app, NMLVCUSTOMDRAW& draw) {
+    if (draw.nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+    if (draw.nmcd.dwDrawStage == CDDS_ITEMPREPAINT) return CDRF_NOTIFYSUBITEMDRAW;
+    if (draw.nmcd.dwDrawStage != (CDDS_ITEMPREPAINT | CDDS_SUBITEM) || draw.iSubItem != 0) return CDRF_DODEFAULT;
+    const auto index = static_cast<std::size_t>(draw.nmcd.dwItemSpec);
+    if (index >= app.processRows.size()) return CDRF_DODEFAULT;
+    const auto& row = app.processRows[index];
+    RECT bounds{};
+    ListView_GetSubItemRect(app.table, static_cast<int>(index), 0, LVIR_BOUNDS, &bounds);
+    bounds.right = bounds.left + ListView_GetColumnWidth(app.table, 0);
+    const int saved = SaveDC(draw.nmcd.hdc);
+    IntersectClipRect(draw.nmcd.hdc, bounds.left, bounds.top, bounds.right, bounds.bottom);
+    const bool selected = !row.section && (ListView_GetItemState(app.table, static_cast<int>(index), LVIS_SELECTED) & LVIS_SELECTED);
+    HBRUSH background = CreateSolidBrush(selected ? (GetFocus() == app.table ? RGB(204,232,255) : RGB(217,217,217)) : GetSysColor(COLOR_WINDOW));
+    FillRect(draw.nmcd.hdc, &bounds, background); DeleteObject(background);
+    SetBkMode(draw.nmcd.hdc, TRANSPARENT); SelectObject(draw.nmcd.hdc, app.font);
+    SetTextColor(draw.nmcd.hdc, row.section ? RGB(37,99,160) : GetSysColor(COLOR_WINDOWTEXT));
+    const int center = (bounds.top + bounds.bottom) / 2;
+    if (!row.section) {
+        if (row.header) {
+            const int x = bounds.left + app.px(12), r = app.px(3);
+            const POINT collapsed[]{{x-r,center-r},{x,center},{x-r,center+r}};
+            const POINT expanded[]{{x-r,center-r},{x,center},{x+r,center-r}};
+            HPEN pen = CreatePen(PS_SOLID, std::max(1,app.px(1)), GetSysColor(COLOR_WINDOWTEXT));
+            const auto previous = SelectObject(draw.nmcd.hdc, pen);
+            Polyline(draw.nmcd.hdc, row.expanded ? expanded : collapsed, 3);
+            SelectObject(draw.nmcd.hdc, previous); DeleteObject(pen);
+        }
+        HICON icon{};
+        if (row.process.icon) icon = app.dpi <= 96 ? row.process.icon->smallIcon : row.process.icon->largeIcon;
+        if (!icon) icon = LoadIconW(nullptr, IDI_APPLICATION);
+        const int x = bounds.left + app.px(row.child ? 46 : 26), size = app.px(16);
+        DrawIconEx(draw.nmcd.hdc, x, center-size/2, icon, size, size, 0, nullptr, DI_NORMAL);
+    }
+    bounds.left += app.px(row.section ? 12 : row.child ? 68 : 48);
+    bounds.right -= app.px(6);
+    DrawTextW(draw.nmcd.hdc, app.textRows[index][0].c_str(), -1, &bounds, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    RestoreDC(draw.nmcd.hdc, saved);
+    return CDRF_SKIPDEFAULT;
 }
 void refresh(App& app) {
     app.latest = app.engine->snapshot();
@@ -471,6 +532,8 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam
         if(notification->hwndFrom==app->tabs&&notification->code==TCN_SELCHANGE) {
             rememberColumns(*app); app->settings.view=TabCtrl_GetCurSel(app->tabs); columns(*app); rebuild(*app); layout(*app);
         } else if(notification->hwndFrom==app->table) {
+            if (notification->code == NM_CUSTOMDRAW && app->settings.view == 1)
+                return drawProcess(*app, *reinterpret_cast<NMLVCUSTOMDRAW*>(lParam));
             if (notification->code == NM_CLICK && app->settings.view == 1) {
                 const auto* click = reinterpret_cast<NMITEMACTIVATE*>(lParam);
                 if (click->iSubItem == 0) expandProcess(*app, click->iItem);

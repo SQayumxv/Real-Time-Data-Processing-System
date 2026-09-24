@@ -3,6 +3,7 @@
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <shellapi.h>
+#include <dwmapi.h>
 #include <array>
 #include <chrono>
 #include <set>
@@ -25,6 +26,31 @@ std::uint64_t ticks(FILETIME value) {
 ReadingState failure() {
     return GetLastError() == ERROR_ACCESS_DENIED ? ReadingState::accessDenied : ReadingState::unavailable;
 }
+std::wstring description(const std::wstring& path) {
+    DWORD ignored{};
+    const DWORD size = GetFileVersionInfoSizeW(path.c_str(), &ignored);
+    if (!size || size > 4 * 1024 * 1024) return {};
+    std::vector<BYTE> data(size);
+    if (!GetFileVersionInfoW(path.c_str(), 0, size, data.data())) return {};
+    struct Translation { WORD language, codepage; };
+    Translation* translations{}; UINT length{};
+    if (!VerQueryValueW(data.data(), L"\\VarFileInfo\\Translation", reinterpret_cast<void**>(&translations), &length)) return {};
+    for (UINT i = 0; i < length / sizeof(Translation); ++i) {
+        wchar_t key[80]{};
+        swprintf_s(key, L"\\StringFileInfo\\%04x%04x\\FileDescription", translations[i].language, translations[i].codepage);
+        wchar_t* value{}; UINT count{};
+        if (VerQueryValueW(data.data(), key, reinterpret_cast<void**>(&value), &count) && count > 1) return value;
+    }
+    return {};
+}
+BOOL CALLBACK applicationWindow(HWND window, LPARAM parameter) {
+    if (!IsWindowVisible(window) || GetWindow(window, GW_OWNER) || (GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)) return TRUE;
+    DWORD cloaked{};
+    if (SUCCEEDED(DwmGetWindowAttribute(window, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked) return TRUE;
+    DWORD process{}; GetWindowThreadProcessId(window, &process);
+    reinterpret_cast<std::set<std::uint32_t>*>(parameter)->insert(process);
+    return TRUE;
+}
 }
 ProcessIcon::~ProcessIcon() {
     if (smallIcon) DestroyIcon(smallIcon);
@@ -32,6 +58,8 @@ ProcessIcon::~ProcessIcon() {
 }
 ProcessList ProcessSampler::sample() {
     ProcessList result;
+    std::set<std::uint32_t> applications;
+    EnumWindows(applicationWindow, reinterpret_cast<LPARAM>(&applications));
     Handle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
     if (!snapshot.valid()) { reset(); return result; }
     PROCESSENTRY32W entry{};
@@ -44,6 +72,8 @@ ProcessList ProcessSampler::sample() {
         ProcessData row;
         row.name = entry.szExeFile;
         row.processId = entry.th32ProcessID;
+        row.parentId = entry.th32ParentProcessID;
+        row.application = applications.contains(row.processId);
         Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, row.processId));
         if (process.valid()) {
             std::array<wchar_t, 32768> path{};
@@ -56,9 +86,11 @@ ProcessList ProcessSampler::sample() {
                 if (found == icons_.end()) {
                     auto icon = std::make_shared<ProcessIcon>();
                     ExtractIconExW(executable.c_str(), 0, &icon->largeIcon, &icon->smallIcon, 1);
-                    found = icons_.emplace(std::move(executable), std::move(icon)).first;
+                    Appearance appearance{std::move(icon), description(executable)};
+                    found = icons_.emplace(std::move(executable), std::move(appearance)).first;
                 }
-                row.icon = found->second;
+                row.icon = found->second.icon;
+                row.displayName = found->second.name;
             }
             FILETIME created{}, exited{}, kernel{}, user{}, now{};
             if (GetProcessTimes(process.get(), &created, &exited, &kernel, &user)) {
