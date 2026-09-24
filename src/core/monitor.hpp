@@ -1,47 +1,70 @@
 #pragma once
+#include "core/buffer.hpp"
+#include "core/recording.hpp"
+#include "core/sensors.hpp"
 #include "system/meminfo.hpp"
 #include "system/processinfo.hpp"
-#include <chrono>
-#include <condition_variable>
-#include <functional>
-#include <mutex>
-#include <thread>
+#include <memory>
 
-struct Snapshot {
+struct PipelineConfig {
+    int systemMs = 250, processMs = 1000, displayMs = 100;
+    SensorConfig sensors;
+};
+struct SystemFrame {
     Reading<double> cpu{0, ReadingState::collecting};
     Reading<MemoryUsage> memory;
     std::uint64_t uptime{};
-    ProcessList processes;
-    std::chrono::steady_clock::time_point captured{};
-    std::chrono::system_clock::time_point wallTime{};
-    bool failed = false;
+    SampleTiming timing;
+    bool failed{};
 };
-
-class SystemSampler {
+struct ProcessFrame {
+    std::shared_ptr<const ProcessList> data;
+    SampleTiming timing, dataTiming;
+    bool failed{};
+};
+struct DashboardSnapshot {
+    SystemFrame system;
+    ProcessFrame processes;
+    SensorFrame sensors;
+    std::array<TimingSummary, 3> timings;
+    std::uint64_t droppedSamples{}, abandonedSamples{};
+    std::size_t queuedSamples{};
+    bool paused{}, highResolution{}, timerFailed{};
+    double lastOverflow{};
+    std::uint64_t generation{};
+};
+class MonitorEngine {
 public:
-    Snapshot sample(bool reset);
+    explicit MonitorEngine(PipelineConfig config = {});
+    ~MonitorEngine();
+    void configure(PipelineConfig config, bool paused);
+    DashboardSnapshot snapshot() const;
+    PipelineConfig config() const;
+    CsvWriter& recorder() { return *recorder_; }
+    static std::vector<DataRecord> records(const DashboardSnapshot& snapshot, double now);
+    MonitorEngine(const MonitorEngine&) = delete;
+    MonitorEngine& operator=(const MonitorEngine&) = delete;
 private:
+    void collectSystem(SampleTiming timing);
+    void collectProcesses(SampleTiming timing);
+    void collectSensors(SampleTiming timing);
+    void processSensors();
+    mutable std::mutex configMutex_, stateMutex_;
+    PipelineConfig config_;
+    std::atomic<std::uint64_t> generation_{0}, dropped_{0}, abandoned_{0};
+    std::atomic<bool> paused_{false};
+    std::atomic<double> lastOverflow_{0};
     CpuSampler cpu_;
     ProcessSampler processes_;
-};
-
-class MonitorWorker {
-public:
-    using Source = std::function<Snapshot(bool)>;
-    explicit MonitorWorker(Source source, int intervalMs = 2000);
-    ~MonitorWorker();
-    void configure(int intervalMs, bool paused);
-    std::optional<Snapshot> take();
-    MonitorWorker(const MonitorWorker&) = delete;
-    MonitorWorker& operator=(const MonitorWorker&) = delete;
-private:
-    void run();
-    Source source_;
-    std::mutex mutex_;
-    std::condition_variable changed_;
-    std::optional<Snapshot> pending_;
-    int intervalMs_;
-    bool paused_ = false, stopping_ = false;
-    std::uint64_t generation_ = 0;
-    std::thread thread_;
+    SensorSimulator simulator_;
+    SensorProcessor processor_;
+    SystemFrame system_;
+    ProcessFrame process_;
+    SensorFrame sensor_;
+    std::array<TimingHistory, 3> timings_;
+    SpscBuffer<SensorInput, 256> queue_;
+    HANDLE inputReady_{}, stopProcessing_{};
+    std::thread processing_;
+    std::unique_ptr<CsvWriter> recorder_;
+    std::unique_ptr<PeriodicTask> systemTask_, processTask_, sensorTask_;
 };

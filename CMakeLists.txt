@@ -12,6 +12,9 @@ endif()
 add_library(monitor_core
     src/core/measurement.cpp
     src/core/monitor.cpp
+    src/core/timing.cpp
+    src/core/sensors.cpp
+    src/core/recording.cpp
     src/system/meminfo.cpp
     src/system/processinfo.cpp
     src/system/stat.cpp
@@ -26,6 +29,7 @@ target_link_libraries(monitor_core PUBLIC psapi shell32 ole32)
 add_executable(untitled7 WIN32
     src/app/main.cpp
     src/ui/gui.cpp
+    src/ui/options.cpp
     resources/app.rc
 )
 

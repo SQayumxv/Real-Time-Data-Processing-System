@@ -17,21 +17,6 @@ template<class T> int compareReading(const Reading<T>& a, const Reading<T>& b, b
     const int result = a.value < b.value ? -1 : a.value > b.value ? 1 : 0;
     return ascending ? result : -result;
 }
-std::string utf8(const std::wstring& text) {
-    if (text.empty()) return {};
-    const int size = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
-    std::string result(static_cast<size_t>(size), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), result.data(), size, nullptr, nullptr);
-    return result;
-}
-std::string csvText(std::wstring value) {
-    const auto first = value.find_first_not_of(L" \t\r\n");
-    if (first != std::wstring::npos && std::wstring(L"=+-@").find(value[first]) != std::wstring::npos)
-        value.insert(value.begin(), L'\'');
-    std::string result = "\"";
-    for (char c : utf8(value)) { if (c == '"') result += '"'; result += c; }
-    return result + "\"";
-}
 }
 std::vector<ProcessData> makeRows(std::span<const ProcessData> processes,
                                 const std::wstring& filter, SortColumn column, bool ascending) {
@@ -73,22 +58,4 @@ std::array<std::wstring, 5> cells(const ProcessData& process) {
 }
 bool sameProcess(const ProcessData& a, const ProcessData& b) {
     return a.processId == b.processId && a.creationTime == b.creationTime && a.name == b.name;
-}
-bool exportCsv(const std::filesystem::path& path, std::span<const ProcessData> rows,
-               const std::wstring& capturedAt, bool stale) {
-    std::ofstream out(path, std::ios::binary);
-    if (!out) return false;
-    out << "\xEF\xBB\xBF" << "Captured at,Stale,Process,PID,CPU (% total capacity),Working set (MiB),Uptime (seconds),CPU status,Memory status,Uptime status\r\n";
-    for (const auto& row : rows) {
-        out << csvText(capturedAt) << ',' << (stale ? "true" : "false") << ',' << csvText(row.name) << ',' << row.processId << ',';
-        if (row.cpu.valid()) out << utf8(decimal(row.cpu.value, 2));
-        out << ',';
-        if (row.memoryBytes.valid()) out << utf8(decimal(static_cast<double>(row.memoryBytes.value) / 1048576.0, 2));
-        out << ',';
-        if (row.uptimeSec.valid()) out << row.uptimeSec.value;
-        out << ',' << csvText(stateText(row.cpu.state)) << ',' << csvText(stateText(row.memoryBytes.state)) << ','
-            << csvText(stateText(row.uptimeSec.state)) << "\r\n";
-    }
-    out.flush();
-    return out.good();
 }

@@ -11,5 +11,3 @@ std::wstring decimal(double value, int precision = 1);
 std::wstring durationText(std::uint64_t seconds);
 std::array<std::wstring, 5> cells(const ProcessData& process);
 bool sameProcess(const ProcessData& a, const ProcessData& b);
-bool exportCsv(const std::filesystem::path& path, std::span<const ProcessData> rows,
-               const std::wstring& capturedAt, bool stale);
