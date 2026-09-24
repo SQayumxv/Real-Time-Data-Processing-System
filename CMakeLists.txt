@@ -10,19 +10,26 @@ if(NOT WIN32)
 endif()
 
 add_library(monitor_core
-    measurement.cpp monitor.cpp presentation.cpp settings.cpp
-    meminfo.cpp processinfo.cpp stat.cpp uptime.cpp
+    src/core/measurement.cpp
+    src/core/monitor.cpp
+    src/system/meminfo.cpp
+    src/system/processinfo.cpp
+    src/system/stat.cpp
+    src/system/uptime.cpp
+    src/ui/presentation.cpp
+    src/app/settings.cpp
 )
-target_include_directories(monitor_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_include_directories(monitor_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_definitions(monitor_core PUBLIC UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
 target_link_libraries(monitor_core PUBLIC psapi shell32 ole32)
 
 add_executable(untitled7 WIN32
-    main.cpp
-    gui.cpp
-    app.rc
+    src/app/main.cpp
+    src/ui/gui.cpp
+    resources/app.rc
 )
 
+target_include_directories(untitled7 PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/resources")
 target_link_libraries(untitled7 PRIVATE monitor_core user32 gdi32 comctl32 comdlg32 uxtheme)
 if(MSVC)
     target_link_options(untitled7 PRIVATE /MANIFEST:NO)

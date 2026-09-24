@@ -1,6 +1,6 @@
 #pragma once
-#include "meminfo.hpp"
-#include "processinfo.hpp"
+#include "system/meminfo.hpp"
+#include "system/processinfo.hpp"
 #include <chrono>
 #include <condition_variable>
 #include <functional>

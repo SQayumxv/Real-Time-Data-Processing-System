@@ -1,6 +1,6 @@
-#include "monitor.hpp"
-#include "stat.hpp"
-#include "uptime.hpp"
+#include "core/monitor.hpp"
+#include "system/stat.hpp"
+#include "system/uptime.hpp"
 #include <algorithm>
 
 Snapshot SystemSampler::sample(bool reset) {

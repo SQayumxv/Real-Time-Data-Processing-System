@@ -1,4 +1,4 @@
-#include "stat.hpp"
+#include "system/stat.hpp"
 #include <windows.h>
 std::optional<CpuCounters> readCpuCounters() {
     if (GetActiveProcessorGroupCount() > 1) return std::nullopt;

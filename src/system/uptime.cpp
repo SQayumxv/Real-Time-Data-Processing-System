@@ -1,4 +1,4 @@
-#include "uptime.hpp"
+#include "system/uptime.hpp"
 #include <windows.h>
 
 ULONGLONG getUptimeSeconds()

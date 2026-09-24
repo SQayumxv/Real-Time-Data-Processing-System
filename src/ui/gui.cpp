@@ -1,7 +1,7 @@
-#include "gui.hpp"
-#include "monitor.hpp"
-#include "presentation.hpp"
-#include "settings.hpp"
+#include "ui/gui.hpp"
+#include "core/monitor.hpp"
+#include "ui/presentation.hpp"
+#include "app/settings.hpp"
 #include <commctrl.h>
 #include <commdlg.h>
 #include <uxtheme.h>
