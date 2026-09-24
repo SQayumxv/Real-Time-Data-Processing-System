@@ -1,0 +1,13 @@
+/.idea/
+/cmake-build-*/
+/build/
+/.vs/
+/tests/
+/Testing/
+/gui-smoke.*
+*.user
+*.pdb
+*.ilk
+*.obj
+*.exe
+*.csv

@@ -3,7 +3,6 @@
 
 #include <windows.h>
 
-// Returns system-wide uptime in seconds
 ULONGLONG getUptimeSeconds();
 
-#endif // UPTIME_HPP
+#endif

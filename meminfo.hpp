@@ -1,9 +1,4 @@
-#ifndef MEMINFO_HPP
-#define MEMINFO_HPP
-
-#include <windows.h>
-
-// Writes total MB to totalMB, free MB to freeMB
-void getMemoryUsage(DWORDLONG& totalMB, DWORDLONG& freeMB);
-
-#endif // MEMINFO_HPP
+﻿#pragma once
+#include "measurement.hpp"
+struct MemoryUsage { std::uint64_t totalBytes{}, availableBytes{}; };
+Reading<MemoryUsage> getMemoryUsage();

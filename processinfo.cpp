@@ -1,118 +1,72 @@
 #include "processinfo.hpp"
 #include <windows.h>
 #include <tlhelp32.h>
-#include <psapi.h>   // for GetProcessMemoryInfo
-#include <string>
-#include <vector>
+#include <psapi.h>
 #include <chrono>
-#include <cstdlib>  // For std::mbstowcs
-#include <string>
+#include <set>
 
-std::wstring ConvertToWString(const char* ansiStr)
-{
-    if (ansiStr == nullptr)
-        return L"";
-
-    // Determine the length required for the wide string
-    size_t len = std::mbstowcs(nullptr, ansiStr, 0);
-    if (len == static_cast<size_t>(-1))
-        return L"";
-
-    // Allocate a buffer for the wide string
-    std::wstring wideStr(len, L'\0');
-
-    // Perform the conversion
-    std::mbstowcs(&wideStr[0], ansiStr, len);
-
-    return wideStr;
+namespace {
+class Handle {
+public:
+    explicit Handle(HANDLE handle) : handle_(handle) {}
+    ~Handle() { if (valid()) CloseHandle(handle_); }
+    Handle(const Handle&) = delete;
+    Handle& operator=(const Handle&) = delete;
+    bool valid() const { return handle_ && handle_ != INVALID_HANDLE_VALUE; }
+    HANDLE get() const { return handle_; }
+private:
+    HANDLE handle_;
+};
+std::uint64_t ticks(FILETIME value) {
+    return (static_cast<std::uint64_t>(value.dwHighDateTime) << 32) | value.dwLowDateTime;
 }
-
-
-
-std::vector<ProcessData> getProcessList()
-{
-    std::vector<ProcessData> result;
-
-    // Take a snapshot of all processes
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE)
-        return result;
-
-    PROCESSENTRY32 pe32;
-    pe32.dwSize = sizeof(pe32);
-
-    if (!Process32First(hSnapshot, &pe32))
-    {
-        CloseHandle(hSnapshot);
-        return result;
-    }
-
-    do
-    {
-        // We'll fill a ProcessData
-        ProcessData pd;
-        pd.processId = pe32.th32ProcessID;
-        pd.name = ConvertToWString(pe32.szExeFile);
-
-
-        // Try to open process for query
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-                                      FALSE,
-                                      pd.processId);
-        if (hProcess)
-        {
-            // 1) Memory usage
-            PROCESS_MEMORY_COUNTERS pmc;
-            if (GetProcessMemoryInfo(hProcess, (PROCESS_MEMORY_COUNTERS*)&pmc, sizeof(pmc)))
-            {
-                DWORDLONG workingSet = pmc.WorkingSetSize; // in bytes
-                pd.memoryMB = workingSet / (1024ULL * 1024ULL);
+ReadingState failure() {
+    return GetLastError() == ERROR_ACCESS_DENIED ? ReadingState::accessDenied : ReadingState::unavailable;
+}
+}
+ProcessList ProcessSampler::sample() {
+    ProcessList result;
+    Handle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+    if (!snapshot.valid()) { reset(); return result; }
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    if (!Process32FirstW(snapshot.get(), &entry)) { reset(); return result; }
+    std::set<std::uint32_t> sampled;
+    const unsigned processors = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    do {
+        ProcessData row;
+        row.name = entry.szExeFile;
+        row.processId = entry.th32ProcessID;
+        Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, row.processId));
+        if (process.valid()) {
+            FILETIME created{}, exited{}, kernel{}, user{}, now{};
+            if (GetProcessTimes(process.get(), &created, &exited, &kernel, &user)) {
+                row.creationTime = ticks(created);
+                GetSystemTimeAsFileTime(&now);
+                if (ticks(now) >= row.creationTime)
+                    row.uptimeSec = Reading<std::uint64_t>::ready((ticks(now) - row.creationTime) / 10000000ULL);
+                const double seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                row.cpu = cpu_[row.processId].sample(row.creationTime, ticks(kernel) + ticks(user), seconds, processors);
+                sampled.insert(row.processId);
+            } else {
+                row.cpu.state = row.uptimeSec.state = failure();
             }
-            else
-            {
-                pd.memoryMB = 0;
-            }
-
-            // 2) Uptime: get creation time from GetProcessTimes
-            FILETIME ftCreate, ftExit, ftKernel, ftUser;
-            if (GetProcessTimes(hProcess, &ftCreate, &ftExit, &ftKernel, &ftUser))
-            {
-                // Convert ftCreate (FILETIME) to ULONGLONG of 100-nanosecs since 1601
-                ULONGLONG create64 = ((ULONGLONG)ftCreate.dwHighDateTime << 32)
-                                   | (ULONGLONG)ftCreate.dwLowDateTime;
-
-                // Current system time in same format
-                FILETIME ftNow;
-                GetSystemTimeAsFileTime(&ftNow);
-                ULONGLONG now64 = ((ULONGLONG)ftNow.dwHighDateTime << 32)
-                                | (ULONGLONG)ftNow.dwLowDateTime;
-
-                // difference in 100-nanosecs
-                ULONGLONG diff = (now64 - create64);
-
-                // convert to seconds
-                // 1 second = 10,000,000 (100-nanosec units)
-                pd.uptimeSec = diff / 10000000ULL;
-            }
-            else
-            {
-                pd.uptimeSec = 0;
-            }
-
-            CloseHandle(hProcess);
+            Handle memoryProcess(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, row.processId));
+            if (memoryProcess.valid()) {
+                PROCESS_MEMORY_COUNTERS counters{};
+                counters.cb = sizeof(counters);
+                if (GetProcessMemoryInfo(memoryProcess.get(), &counters, sizeof(counters)))
+                    row.memoryBytes = Reading<std::uint64_t>::ready(counters.WorkingSetSize);
+                else row.memoryBytes.state = failure();
+            } else row.memoryBytes.state = failure();
+        } else {
+            row.cpu.state = row.memoryBytes.state = row.uptimeSec.state = failure();
         }
-        else
-        {
-            // Could not open process
-            pd.memoryMB  = 0;
-            pd.uptimeSec = 0;
-        }
-
-        // Add to result
-        result.push_back(pd);
-
-    } while (Process32Next(hSnapshot, &pe32));
-
-    CloseHandle(hSnapshot);
+        result.rows.push_back(std::move(row));
+    } while (Process32NextW(snapshot.get(), &entry));
+    if (GetLastError() != ERROR_NO_MORE_FILES) { reset(); return {}; }
+    std::erase_if(cpu_, [&](const auto& item) { return !sampled.contains(item.first); });
+    result.available = true;
     return result;
 }

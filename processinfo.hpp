@@ -1,20 +1,23 @@
-#ifndef PROCESSINFO_HPP
-#define PROCESSINFO_HPP
-
-#include <string>
+﻿#pragma once
+#include "measurement.hpp"
+#include <map>
 #include <vector>
-#include <windows.h>
-
-// Holds info about a single process
-struct ProcessData
-{
-    std::wstring name;    // e.g. "services.exe"
-    DWORD        processId;
-    DWORDLONG    memoryMB;  // working set in MB
-    ULONGLONG    uptimeSec; // how long the process has run
+struct ProcessData {
+    std::wstring name;
+    std::uint32_t processId{};
+    std::uint64_t creationTime{};
+    Reading<std::uint64_t> memoryBytes;
+    Reading<std::uint64_t> uptimeSec;
+    Reading<double> cpu;
 };
-
-// Enumerates processes, returns a list
-std::vector<ProcessData> getProcessList();
-
-#endif // PROCESSINFO_HPP
+struct ProcessList {
+    std::vector<ProcessData> rows;
+    bool available = false;
+};
+class ProcessSampler {
+public:
+    ProcessList sample();
+    void reset() { cpu_.clear(); }
+private:
+    std::map<std::uint32_t, ProcessCpuSampler> cpu_;
+};

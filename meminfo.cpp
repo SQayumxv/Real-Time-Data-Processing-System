@@ -1,22 +1,9 @@
-#include "meminfo.hpp"
+﻿#include "meminfo.hpp"
 #include <windows.h>
-
-void getMemoryUsage(DWORDLONG& totalMB, DWORDLONG& freeMB)
-{
-    MEMORYSTATUSEX memStatus;
-    memStatus.dwLength = sizeof(memStatus);
-
-    if (GlobalMemoryStatusEx(&memStatus))
-    {
-        DWORDLONG totalPhys = memStatus.ullTotalPhys;
-        DWORDLONG availPhys = memStatus.ullAvailPhys;
-
-        totalMB = totalPhys / (1024ULL * 1024ULL);
-        freeMB  = availPhys / (1024ULL * 1024ULL);
-    }
-    else
-    {
-        totalMB = 0;
-        freeMB  = 0;
-    }
+Reading<MemoryUsage> getMemoryUsage() {
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (!GlobalMemoryStatusEx(&status) || status.ullTotalPhys == 0 ||
+        status.ullAvailPhys > status.ullTotalPhys) return {};
+    return Reading<MemoryUsage>::ready({status.ullTotalPhys, status.ullAvailPhys});
 }
