@@ -2,6 +2,8 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <psapi.h>
+#include <shellapi.h>
+#include <array>
 #include <chrono>
 #include <set>
 
@@ -24,6 +26,10 @@ ReadingState failure() {
     return GetLastError() == ERROR_ACCESS_DENIED ? ReadingState::accessDenied : ReadingState::unavailable;
 }
 }
+ProcessIcon::~ProcessIcon() {
+    if (smallIcon) DestroyIcon(smallIcon);
+    if (largeIcon) DestroyIcon(largeIcon);
+}
 ProcessList ProcessSampler::sample() {
     ProcessList result;
     Handle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
@@ -32,6 +38,7 @@ ProcessList ProcessSampler::sample() {
     entry.dwSize = sizeof(entry);
     if (!Process32FirstW(snapshot.get(), &entry)) { reset(); return result; }
     std::set<std::uint32_t> sampled;
+    std::set<std::wstring> paths;
     const unsigned processors = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
     do {
         ProcessData row;
@@ -39,6 +46,19 @@ ProcessList ProcessSampler::sample() {
         row.processId = entry.th32ProcessID;
         Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, row.processId));
         if (process.valid()) {
+            std::array<wchar_t, 32768> path{};
+            DWORD length = static_cast<DWORD>(path.size());
+            if (QueryFullProcessImageNameW(process.get(), 0, path.data(), &length)) {
+                std::wstring executable(path.data(), length);
+                paths.insert(executable);
+                auto found = icons_.find(executable);
+                if (found == icons_.end()) {
+                    auto icon = std::make_shared<ProcessIcon>();
+                    ExtractIconExW(executable.c_str(), 0, &icon->largeIcon, &icon->smallIcon, 1);
+                    found = icons_.emplace(std::move(executable), std::move(icon)).first;
+                }
+                row.icon = found->second;
+            }
             FILETIME created{}, exited{}, kernel{}, user{}, now{};
             if (GetProcessTimes(process.get(), &created, &exited, &kernel, &user)) {
                 row.creationTime = ticks(created);
@@ -67,6 +87,7 @@ ProcessList ProcessSampler::sample() {
     } while (Process32NextW(snapshot.get(), &entry));
     if (GetLastError() != ERROR_NO_MORE_FILES) { reset(); return {}; }
     std::erase_if(cpu_, [&](const auto& item) { return !sampled.contains(item.first); });
+    std::erase_if(icons_, [&](const auto& item) { return !paths.contains(item.first); });
     result.available = true;
     return result;
 }

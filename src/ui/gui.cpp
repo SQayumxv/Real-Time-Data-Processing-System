@@ -16,6 +16,8 @@ struct Point { double time; std::array<Reading<double>, 3> values; };
 struct App {
     HWND window{}, table{}, tabs{}, search{}, searchLabel{}, pause{}, exportButton{}, options{}, record{};
     HFONT font{};
+    HIMAGELIST processIcons{};
+    std::vector<int> rowIcons;
     UINT dpi = 96;
     Settings settings;
     std::filesystem::path settingsFile;
@@ -84,6 +86,31 @@ void rememberColumns(App& app) {
     if (app.settings.view == 1)
         for (int i = 0; i < 5; ++i)
             app.settings.columns[i] = MulDiv(ListView_GetColumnWidth(app.table, i), 96, static_cast<int>(app.dpi));
+}
+void updateIcons(App& app) {
+    ListView_SetImageList(app.table, nullptr, LVSIL_SMALL);
+    if (app.processIcons) ImageList_Destroy(app.processIcons);
+    app.processIcons = nullptr;
+    app.rowIcons.assign(app.rows.size(), 0);
+    if (app.settings.view != 1) return;
+    const int size = app.px(16);
+    app.processIcons = ImageList_Create(size, size, ILC_COLOR32 | ILC_MASK, 16, 16);
+    if (!app.processIcons) return;
+    ImageList_AddIcon(app.processIcons, LoadIconW(nullptr, IDI_APPLICATION));
+    std::map<const ProcessIcon*, int> indices;
+    for (std::size_t i = 0; i < app.rows.size(); ++i) {
+        const auto* icon = app.rows[i].icon.get();
+        if (!icon) continue;
+        auto found = indices.find(icon);
+        if (found == indices.end()) {
+            HICON handle = size <= 16 ? icon->smallIcon : icon->largeIcon;
+            if (!handle) handle = icon->largeIcon ? icon->largeIcon : icon->smallIcon;
+            const int index = handle ? ImageList_AddIcon(app.processIcons, handle) : 0;
+            found = indices.emplace(icon, std::max(0, index)).first;
+        }
+        app.rowIcons[i] = found->second;
+    }
+    ListView_SetImageList(app.table, app.processIcons, LVSIL_SMALL);
 }
 void columns(App& app) {
     ListView_SetItemCount(app.table, 0);
@@ -155,6 +182,7 @@ void rebuild(App& app) {
             }
         }
     }
+    updateIcons(app);
     ListView_SetItemCountEx(app.table, static_cast<int>(app.textRows.size()), LVSICF_NOSCROLL);
     int restoredTop = -1;
     if (app.settings.view == 1) for (int i = 0; i < static_cast<int>(app.rows.size()); ++i) {
@@ -356,7 +384,7 @@ bool createControls(App& app,HINSTANCE instance) {
     app.searchLabel=child(L"STATIC",L"&Search",0,0);
     app.search=child(L"EDIT",L"",WS_TABSTOP|ES_AUTOHSCROLL,searchId,WS_EX_CLIENTEDGE);
     SendMessageW(app.search,EM_SETCUEBANNER,TRUE,reinterpret_cast<LPARAM>(L"Process name or PID"));
-    app.table=child(WC_LISTVIEWW,L"Data",WS_TABSTOP|LVS_REPORT|LVS_OWNERDATA|LVS_SINGLESEL|LVS_SHOWSELALWAYS,tableId,WS_EX_CLIENTEDGE);
+    app.table=child(WC_LISTVIEWW,L"Data",WS_TABSTOP|LVS_REPORT|LVS_OWNERDATA|LVS_SINGLESEL|LVS_SHOWSELALWAYS|LVS_SHAREIMAGELISTS,tableId,WS_EX_CLIENTEDGE);
     if(!app.tabs||!app.table||!app.search||!app.record||!app.options||!app.pause||!app.exportButton) return false;
     ListView_SetExtendedListViewStyle(app.table,LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER|LVS_EX_LABELTIP);
     SetWindowTheme(app.table,L"Explorer",nullptr);
@@ -404,6 +432,9 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam
         } else if(notification->hwndFrom==app->table) {
             if(notification->code==LVN_GETDISPINFOW) {
                 auto* info=reinterpret_cast<NMLVDISPINFOW*>(lParam);
+                if (info->item.mask & LVIF_IMAGE)
+                    info->item.iImage = app->settings.view == 1 && info->item.iItem >= 0 &&
+                        info->item.iItem < static_cast<int>(app->rowIcons.size()) ? app->rowIcons[info->item.iItem] : I_IMAGENONE;
                 if((info->item.mask&LVIF_TEXT)&&info->item.iItem>=0&&info->item.iItem<static_cast<int>(app->textRows.size())&&
                     info->item.iSubItem>=0&&info->item.iSubItem<static_cast<int>(app->textRows[info->item.iItem].size()))
                     lstrcpynW(info->item.pszText,app->textRows[info->item.iItem][info->item.iSubItem].c_str(),info->item.cchTextMax);
@@ -427,7 +458,7 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam
         const UINT previous=app->dpi; app->dpi=HIWORD(wParam);
         const int count=Header_GetItemCount(ListView_GetHeader(app->table));
         for(int i=0;i<count;++i) ListView_SetColumnWidth(app->table,i,MulDiv(ListView_GetColumnWidth(app->table,i),static_cast<int>(app->dpi),static_cast<int>(previous)));
-        font(*app); const auto* rect=reinterpret_cast<RECT*>(lParam);
+        font(*app); updateIcons(*app); const auto* rect=reinterpret_cast<RECT*>(lParam);
         SetWindowPos(window,nullptr,rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top,SWP_NOZORDER|SWP_NOACTIVATE); layout(*app); return 0;
     }
     case WM_ERASEBKGND: return 1;
@@ -440,6 +471,7 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam
     case WM_CLOSE: persist(*app); DestroyWindow(window); return 0;
     case WM_DESTROY:
         KillTimer(window,pollTimer); app->engine.reset(); app->exporter.reset();
+        if (app->processIcons) { ImageList_Destroy(app->processIcons); app->processIcons = nullptr; }
         if(app->font) { DeleteObject(app->font); app->font=nullptr; }
         PostQuitMessage(0); return 0;
     }
