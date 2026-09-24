@@ -18,15 +18,7 @@ template<class T> int compareReading(const Reading<T>& a, const Reading<T>& b, b
     return ascending ? result : -result;
 }
 }
-std::vector<ProcessData> makeRows(std::span<const ProcessData> processes,
-                                const std::wstring& filter, SortColumn column, bool ascending) {
-    std::vector<ProcessData> result;
-    for (const auto& process : processes) {
-        if (filter.empty() || FindStringOrdinal(FIND_FROMSTART, process.name.c_str(), -1, filter.c_str(), -1, TRUE) >= 0 ||
-            std::to_wstring(process.processId).find(filter) != std::wstring::npos)
-            result.push_back(process);
-    }
-    std::sort(result.begin(), result.end(), [=](const auto& a, const auto& b) {
+bool processLess(const ProcessData& a, const ProcessData& b, SortColumn column, bool ascending) {
         int order = 0;
         switch (column) {
         case SortColumn::name: order = compareText(a.name, b.name) * (ascending ? 1 : -1); break;
@@ -36,6 +28,17 @@ std::vector<ProcessData> makeRows(std::span<const ProcessData> processes,
         case SortColumn::uptime: order = compareReading(a.uptimeSec, b.uptimeSec, ascending); break;
         }
         return order != 0 ? order < 0 : a.processId < b.processId;
+}
+std::vector<ProcessData> makeRows(std::span<const ProcessData> processes,
+                                const std::wstring& filter, SortColumn column, bool ascending) {
+    std::vector<ProcessData> result;
+    for (const auto& process : processes) {
+        if (filter.empty() || FindStringOrdinal(FIND_FROMSTART, process.name.c_str(), -1, filter.c_str(), -1, TRUE) >= 0 ||
+            std::to_wstring(process.processId).find(filter) != std::wstring::npos)
+            result.push_back(process);
+    }
+    std::sort(result.begin(), result.end(), [=](const auto& a, const auto& b) {
+        return processLess(a, b, column, ascending);
     });
     return result;
 }
@@ -58,4 +61,58 @@ std::array<std::wstring, 5> cells(const ProcessData& process) {
 }
 bool sameProcess(const ProcessData& a, const ProcessData& b) {
     return a.processId == b.processId && a.creationTime == b.creationTime && a.name == b.name;
+}
+std::vector<ProcessTableRow> groupedRows(std::span<const ProcessData> processes, SortColumn column,
+    bool ascending, const std::map<std::wstring, bool>& expansion, bool searching) {
+    std::map<std::wstring, std::vector<ProcessData>> families;
+    for (const auto& process : processes) {
+        std::wstring key = process.executable;
+        if (!key.empty()) {
+            std::wstring normalized(key.size(), L'\0');
+            if (LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, key.data(), static_cast<int>(key.size()),
+                normalized.data(), static_cast<int>(normalized.size()), nullptr, nullptr, 0)) key = std::move(normalized);
+        } else key = L"pid:" + std::to_wstring(process.processId) + L":" + std::to_wstring(process.creationTime);
+        families[key].push_back(process);
+    }
+    struct Family { ProcessTableRow row; std::vector<ProcessData> members; };
+    std::vector<Family> groups;
+    for (auto& [key, members] : families) {
+        std::sort(members.begin(), members.end(), [&](const auto& a, const auto& b) { return processLess(a,b,column,ascending); });
+        ProcessTableRow row; row.family = key; row.process = members.front(); row.count = members.size();
+        row.header = members.size() > 1;
+        const auto state = expansion.find(key);
+        row.expanded = state == expansion.end() ? searching : state->second;
+        if (row.header) {
+            row.key = L"group:" + key;
+            const auto total = [&]<class T>(Reading<T> ProcessData::* field, bool maximum = false) {
+                T value{};
+                ReadingState invalid = ReadingState::ready;
+                for (const auto& member : members) {
+                    const auto reading = member.*field;
+                    if (!reading.valid()) {
+                        if (invalid == ReadingState::ready || reading.state == ReadingState::accessDenied) invalid = reading.state;
+                    } else value = maximum ? std::max(value, reading.value) : value + reading.value;
+                }
+                return Reading<T>{value, invalid};
+            };
+            row.process.cpu = total(&ProcessData::cpu);
+            row.process.memoryBytes = total(&ProcessData::memoryBytes);
+            row.process.uptimeSec = total(&ProcessData::uptimeSec, true);
+        } else row.key = L"process:" + std::to_wstring(row.process.processId) + L":" + std::to_wstring(row.process.creationTime);
+        groups.push_back({std::move(row), std::move(members)});
+    }
+    std::stable_sort(groups.begin(), groups.end(), [&](const auto& a, const auto& b) {
+        return processLess(a.row.process,b.row.process,column,ascending);
+    });
+    std::vector<ProcessTableRow> result;
+    for (auto& group : groups) {
+        result.push_back(group.row);
+        if (group.row.header && group.row.expanded) for (auto& process : group.members) {
+            ProcessTableRow child;
+            child.family = group.row.family; child.child = true;
+            child.key = L"process:" + std::to_wstring(process.processId) + L":" + std::to_wstring(process.creationTime);
+            child.process = std::move(process); result.push_back(std::move(child));
+        }
+    }
+    return result;
 }

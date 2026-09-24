@@ -50,6 +50,7 @@ ProcessList ProcessSampler::sample() {
             DWORD length = static_cast<DWORD>(path.size());
             if (QueryFullProcessImageNameW(process.get(), 0, path.data(), &length)) {
                 std::wstring executable(path.data(), length);
+                row.executable = executable;
                 paths.insert(executable);
                 auto found = icons_.find(executable);
                 if (found == icons_.end()) {

@@ -19,6 +19,7 @@ struct ProcessData {
     Reading<std::uint64_t> uptimeSec;
     Reading<double> cpu;
     std::shared_ptr<const ProcessIcon> icon;
+    std::wstring executable;
 };
 struct ProcessList {
     std::vector<ProcessData> rows;

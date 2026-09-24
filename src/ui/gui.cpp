@@ -25,6 +25,9 @@ struct App {
     std::unique_ptr<CsvWriter> exporter;
     DashboardSnapshot latest;
     std::vector<ProcessData> rows;
+    std::vector<ProcessData> filteredRows;
+    std::vector<ProcessTableRow> processRows;
+    std::map<std::wstring, bool> expansion;
     std::vector<std::vector<std::wstring>> textRows;
     std::deque<Point> systemHistory, sensorHistory;
     double systemSeen{}, processSeen{}, sensorSeen{};
@@ -130,15 +133,15 @@ void columns(App& app) {
         column.fmt = i == 0 ? LVCFMT_LEFT : LVCFMT_RIGHT;
         ListView_InsertColumn(app.table, i, &column);
     }
-    app.rows.clear(); app.textRows.clear(); app.processSeen = 0;
+    app.rows.clear(); app.processRows.clear(); app.textRows.clear(); app.processSeen = 0;
 }
 void rebuild(App& app) {
     const int selectedIndex = ListView_GetNextItem(app.table, -1, LVNI_SELECTED);
     const int topIndex = ListView_GetTopIndex(app.table);
-    std::optional<ProcessData> selected, top;
+    std::optional<ProcessTableRow> selected, top;
     if (app.settings.view == 1) {
-        if (selectedIndex >= 0 && selectedIndex < static_cast<int>(app.rows.size())) selected = app.rows[selectedIndex];
-        if (topIndex >= 0 && topIndex < static_cast<int>(app.rows.size())) top = app.rows[topIndex];
+        if (selectedIndex >= 0 && selectedIndex < static_cast<int>(app.processRows.size())) selected = app.processRows[selectedIndex];
+        if (topIndex >= 0 && topIndex < static_cast<int>(app.processRows.size())) top = app.processRows[topIndex];
     }
     SendMessageW(app.table, WM_SETREDRAW, FALSE, 0);
     ListView_SetItemState(app.table, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
@@ -146,10 +149,19 @@ void rebuild(App& app) {
     if (app.settings.view == 1) {
         const auto& processes = app.latest.processes;
         if (processes.data)
-            app.rows = makeRows(processes.data->rows, windowText(app.search), static_cast<SortColumn>(app.settings.sortColumn), app.settings.ascending);
-        else app.rows.clear();
-        for (const auto& row : app.rows) {
-            const auto rowCells = cells(row);
+            app.filteredRows = makeRows(processes.data->rows, windowText(app.search), static_cast<SortColumn>(app.settings.sortColumn), app.settings.ascending);
+        else app.filteredRows.clear();
+        app.processRows = groupedRows(app.filteredRows, static_cast<SortColumn>(app.settings.sortColumn),
+            app.settings.ascending, app.expansion, !windowText(app.search).empty());
+        app.rows.clear();
+        for (const auto& row : app.processRows) {
+            app.rows.push_back(row.process);
+            auto rowCells = cells(row.process);
+            if (row.header) {
+                rowCells[0] = (row.expanded ? L"\u25bc " : L"\u25b6 ") + row.process.name + L" (" + std::to_wstring(row.count) + L")";
+                rowCells[1] = L"";
+            }
+            if (row.child) rowCells[0] = L"      " + rowCells[0];
             app.textRows.emplace_back(rowCells.begin(), rowCells.end());
         }
         HWND header = ListView_GetHeader(app.table);
@@ -186,9 +198,15 @@ void rebuild(App& app) {
     ListView_SetItemCountEx(app.table, static_cast<int>(app.textRows.size()), LVSICF_NOSCROLL);
     int restoredTop = -1;
     if (app.settings.view == 1) for (int i = 0; i < static_cast<int>(app.rows.size()); ++i) {
-        if (selected && sameProcess(app.rows[i], *selected))
+        if (selected && app.processRows[i].key == selected->key)
             ListView_SetItemState(app.table, i, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
-        if (top && sameProcess(app.rows[i], *top)) restoredTop = i;
+        if (top && app.processRows[i].key == top->key) restoredTop = i;
+    }
+    if (app.settings.view == 1) for (int i = 0; i < static_cast<int>(app.processRows.size()); ++i) {
+        const auto& row = app.processRows[i];
+        if (!row.child && selected && row.family == selected->family && ListView_GetNextItem(app.table, -1, LVNI_SELECTED) < 0)
+            ListView_SetItemState(app.table, i, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        if (!row.child && top && row.family == top->family && restoredTop < 0) restoredTop = i;
     }
     if (restoredTop >= 0) {
         RECT rect{};
@@ -196,6 +214,28 @@ void rebuild(App& app) {
             ListView_Scroll(app.table, 0, (restoredTop - ListView_GetTopIndex(app.table)) * (rect.bottom - rect.top));
     }
     SendMessageW(app.table, WM_SETREDRAW, TRUE, 0); InvalidateRect(app.table, nullptr, FALSE);
+}
+void expandProcess(App& app, int index, std::optional<bool> expanded = {}) {
+    if (app.settings.view != 1 || index < 0 || index >= static_cast<int>(app.processRows.size())) return;
+    const auto row = app.processRows[index];
+    if (row.header) {
+        app.expansion[row.family] = expanded.value_or(!row.expanded);
+        rebuild(app);
+    } else if (row.child && expanded == false) {
+        app.expansion[row.family] = false;
+        rebuild(app);
+    }
+}
+LRESULT CALLBACK processKeys(HWND window, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR, DWORD_PTR reference) {
+    auto& app = *reinterpret_cast<App*>(reference);
+    if (message == WM_KEYDOWN && app.settings.view == 1 &&
+        (wParam == VK_LEFT || wParam == VK_RIGHT || wParam == VK_SPACE || wParam == VK_RETURN)) {
+        const int index = ListView_GetNextItem(window, -1, LVNI_SELECTED);
+        if (wParam == VK_LEFT || wParam == VK_RIGHT) expandProcess(app, index, wParam == VK_RIGHT);
+        else expandProcess(app, index);
+        return 0;
+    }
+    return DefSubclassProc(window, message, wParam, lParam);
 }
 void refresh(App& app) {
     app.latest = app.engine->snapshot();
@@ -284,7 +324,7 @@ void render(App& app, HDC dc, RECT client) {
         text(dc,{m,app.px(466),right,app.px(494)},L"Process values use their own sample timestamp. Simulated sensors are shown separately.");
     } else if(app.settings.view==1) {
         text(dc,{m,app.px(130),right,app.px(158)},L"Windows processes: "+state(app,processes.dataTiming,processes.failed)+L" | "+age(processes.dataTiming.completed)+
-            L" | "+std::to_wstring(app.rows.size())+L" shown | CPU is % of total capacity; memory is working set");
+            L" | "+std::to_wstring(app.filteredRows.size())+L" processes | group CPU/RAM totals; uptime = oldest member");
     } else if(app.settings.view==2) {
         text(dc,{m,app.px(130),right,app.px(158)},L"SIMULATED DATA: "+state(app,sensors.timing)+L" | "+age(sensors.timing.completed)+
             L" | "+std::to_wstring(app.settings.pipeline.sensors.intervalMs)+L" ms | seed "+std::to_wstring(app.settings.pipeline.sensors.seed));
@@ -341,7 +381,7 @@ void exportRows(App& app) {
     const auto path=chooseCsv(app,false); if(path.empty()) return;
     auto snapshot=app.latest;
     if(app.settings.view==1 && snapshot.processes.data) {
-        auto filtered=std::make_shared<ProcessList>(); filtered->available=true; filtered->rows=app.rows; snapshot.processes.data=std::move(filtered);
+        auto filtered=std::make_shared<ProcessList>(); filtered->available=true; filtered->rows=app.filteredRows; snapshot.processes.data=std::move(filtered);
     }
     auto rows=MonitorEngine::records(snapshot,monotonicSeconds());
     std::erase_if(rows,[&](const auto& row) {
@@ -387,6 +427,7 @@ bool createControls(App& app,HINSTANCE instance) {
     app.table=child(WC_LISTVIEWW,L"Data",WS_TABSTOP|LVS_REPORT|LVS_OWNERDATA|LVS_SINGLESEL|LVS_SHOWSELALWAYS|LVS_SHAREIMAGELISTS,tableId,WS_EX_CLIENTEDGE);
     if(!app.tabs||!app.table||!app.search||!app.record||!app.options||!app.pause||!app.exportButton) return false;
     ListView_SetExtendedListViewStyle(app.table,LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER|LVS_EX_LABELTIP);
+    SetWindowSubclass(app.table, processKeys, 1, reinterpret_cast<DWORD_PTR>(&app));
     SetWindowTheme(app.table,L"Explorer",nullptr);
     font(app); columns(app); layout(app); return true;
 }
@@ -430,7 +471,10 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam
         if(notification->hwndFrom==app->tabs&&notification->code==TCN_SELCHANGE) {
             rememberColumns(*app); app->settings.view=TabCtrl_GetCurSel(app->tabs); columns(*app); rebuild(*app); layout(*app);
         } else if(notification->hwndFrom==app->table) {
-            if(notification->code==LVN_GETDISPINFOW) {
+            if (notification->code == NM_CLICK && app->settings.view == 1) {
+                const auto* click = reinterpret_cast<NMITEMACTIVATE*>(lParam);
+                if (click->iSubItem == 0) expandProcess(*app, click->iItem);
+            } else if(notification->code==LVN_GETDISPINFOW) {
                 auto* info=reinterpret_cast<NMLVDISPINFOW*>(lParam);
                 if (info->item.mask & LVIF_IMAGE)
                     info->item.iImage = app->settings.view == 1 && info->item.iItem >= 0 &&
