@@ -1,4 +1,4 @@
-#include "ui/gui.hpp"
+﻿#include "ui/gui.hpp"
 #include "ui/options.hpp"
 #include "ui/presentation.hpp"
 #include "app/settings.hpp"
@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <deque>
 #include <memory>
+#include <cstring>
 
 namespace {
 constexpr int searchId = 101, pauseId = 103, exportId = 104, tableId = 105, tabsId = 106, optionsId = 107, recordId = 108;
@@ -17,7 +18,7 @@ struct App {
     HWND window{}, table{}, tabs{}, search{}, searchLabel{}, pause{}, exportButton{}, options{}, record{};
     HFONT font{};
     HIMAGELIST processIcons{};
-    std::vector<int> rowIcons;
+    UINT imageDpi{};
     UINT dpi = 96;
     Settings settings;
     std::filesystem::path settingsFile;
@@ -27,7 +28,7 @@ struct App {
     std::vector<ProcessData> rows;
     std::vector<ProcessData> filteredRows;
     std::vector<ProcessTableRow> processRows;
-    std::map<std::wstring, bool> expansion;
+    std::map<std::wstring, bool> expansion, searchExpansion;
     std::vector<std::vector<std::wstring>> textRows;
     std::deque<Point> systemHistory, sensorHistory;
     double systemSeen{}, processSeen{}, sensorSeen{};
@@ -90,30 +91,23 @@ void rememberColumns(App& app) {
         for (int i = 0; i < 5; ++i)
             app.settings.columns[i] = MulDiv(ListView_GetColumnWidth(app.table, i), 96, static_cast<int>(app.dpi));
 }
-void updateIcons(App& app) {
-    ListView_SetImageList(app.table, nullptr, LVSIL_SMALL);
-    if (app.processIcons) ImageList_Destroy(app.processIcons);
-    app.processIcons = nullptr;
-    app.rowIcons.assign(app.rows.size(), 0);
-    if (app.settings.view != 1) return;
-    const int size = app.px(16);
-    app.processIcons = ImageList_Create(size, app.px(24), ILC_COLOR32 | ILC_MASK, 16, 16);
-    if (!app.processIcons) return;
-    ImageList_AddIcon(app.processIcons, LoadIconW(nullptr, IDI_APPLICATION));
-    std::map<const ProcessIcon*, int> indices;
-    for (std::size_t i = 0; i < app.rows.size(); ++i) {
-        const auto* icon = app.rows[i].icon.get();
-        if (!icon) continue;
-        auto found = indices.find(icon);
-        if (found == indices.end()) {
-            HICON handle = size <= 16 ? icon->smallIcon : icon->largeIcon;
-            if (!handle) handle = icon->largeIcon ? icon->largeIcon : icon->smallIcon;
-            const int index = handle ? ImageList_AddIcon(app.processIcons, handle) : 0;
-            found = indices.emplace(icon, std::max(0, index)).first;
-        }
-        app.rowIcons[i] = found->second;
+void updateRowHeight(App& app) {
+    if (app.settings.view != 1) {
+        ListView_SetImageList(app.table, nullptr, LVSIL_SMALL);
+        return;
     }
-    ListView_SetImageList(app.table, app.processIcons, LVSIL_SMALL);
+    if (!app.processIcons || app.imageDpi != app.dpi) {
+        ListView_SetImageList(app.table, nullptr, LVSIL_SMALL);
+        if (app.processIcons) ImageList_Destroy(app.processIcons);
+        app.processIcons = ImageList_Create(app.px(16), app.px(24), ILC_COLOR32 | ILC_MASK, 1, 1);
+        if (app.processIcons) ImageList_AddIcon(app.processIcons, LoadIconW(nullptr, IDI_APPLICATION));
+        app.imageDpi = app.dpi;
+    }
+    if (ListView_GetImageList(app.table, LVSIL_SMALL) != app.processIcons)
+        ListView_SetImageList(app.table, app.processIcons, LVSIL_SMALL);
+}
+std::map<std::wstring, bool>& expansionState(App& app) {
+    return windowText(app.search).empty() ? app.expansion : app.searchExpansion;
 }
 void columns(App& app) {
     ListView_SetItemCount(app.table, 0);
@@ -150,7 +144,7 @@ void rebuild(App& app) {
         const auto& processes = app.latest.processes;
         ProcessTable table;
         if (processes.data) table = processTable(processes.data->rows, windowText(app.search),
-            static_cast<SortColumn>(app.settings.sortColumn), app.settings.ascending, app.expansion);
+            static_cast<SortColumn>(app.settings.sortColumn), app.settings.ascending, expansionState(app));
         app.filteredRows = std::move(table.processes);
         app.processRows = std::move(table.rows);
         app.rows.clear();
@@ -194,7 +188,7 @@ void rebuild(App& app) {
             }
         }
     }
-    updateIcons(app);
+    updateRowHeight(app);
     ListView_SetItemCountEx(app.table, static_cast<int>(app.textRows.size()), LVSICF_NOSCROLL);
     int restoredTop = -1;
     if (app.settings.view == 1) for (int i = 0; i < static_cast<int>(app.rows.size()); ++i) {
@@ -219,12 +213,71 @@ void expandProcess(App& app, int index, std::optional<bool> expanded = {}) {
     if (app.settings.view != 1 || index < 0 || index >= static_cast<int>(app.processRows.size())) return;
     const auto row = app.processRows[index];
     if (row.header) {
-        app.expansion[row.family] = expanded.value_or(!row.expanded);
+        expansionState(app)[row.family] = expanded.value_or(!row.expanded);
         rebuild(app);
     } else if (row.child && expanded == false) {
-        app.expansion[row.family] = false;
+        expansionState(app)[row.family] = false;
         rebuild(app);
     }
+}
+void expandAll(App& app, bool expanded) {
+    auto& state = expansionState(app);
+    for (const auto& row : app.processRows) if (row.header) state[row.family] = expanded;
+    rebuild(app);
+}
+void copyText(App& app, const std::wstring& value) {
+    const auto bytes = (value.size() + 1) * sizeof(wchar_t);
+    HGLOBAL data = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!data) { app.notice = L"Could not copy to clipboard"; return; }
+    void* buffer = GlobalLock(data);
+    if (!buffer) { GlobalFree(data); app.notice = L"Could not copy to clipboard"; return; }
+    std::memcpy(buffer, value.c_str(), bytes); GlobalUnlock(data);
+    bool copied = false;
+    if (OpenClipboard(app.window)) {
+        if (EmptyClipboard()) copied = SetClipboardData(CF_UNICODETEXT, data) != nullptr;
+        CloseClipboard();
+    }
+    if (!copied) GlobalFree(data);
+    app.notice = copied ? L"Copied to clipboard" : L"Could not copy to clipboard";
+    InvalidateRect(app.window, nullptr, FALSE);
+}
+void processMenu(App& app, LPARAM position) {
+    if (app.settings.view != 1) return;
+    POINT point{static_cast<short>(LOWORD(position)), static_cast<short>(HIWORD(position))};
+    int index = ListView_GetNextItem(app.table, -1, LVNI_SELECTED);
+    if (point.x == -1 && point.y == -1) {
+        RECT bounds{};
+        if (index >= 0 && ListView_GetItemRect(app.table,index,&bounds,LVIR_BOUNDS)) point = {bounds.left+app.px(48),bounds.bottom};
+        else point = {app.px(12), app.px(36)};
+        ClientToScreen(app.table, &point);
+    } else {
+        LVHITTESTINFO hit{}; hit.pt = point; ScreenToClient(app.table, &hit.pt);
+        index = ListView_HitTest(app.table, &hit);
+    }
+    std::optional<ProcessTableRow> row;
+    if (index >= 0 && index < static_cast<int>(app.processRows.size()) && !app.processRows[index].section) {
+        row = app.processRows[index];
+        ListView_SetItemState(app.table, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+        ListView_SetItemState(app.table, index, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    }
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+    if (row) {
+        if (row->header) AppendMenuW(menu, MF_STRING, 1, row->expanded ? L"Collapse group" : L"Expand group");
+        AppendMenuW(menu, MF_STRING, 2, L"Copy name");
+        if (!row->header) AppendMenuW(menu, MF_STRING, 3, L"Copy PID");
+        AppendMenuW(menu, MF_STRING | (row->process.executable.empty() ? MF_GRAYED : 0), 4, L"Copy executable path");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    }
+    AppendMenuW(menu, MF_STRING, 5, L"Expand all groups");
+    AppendMenuW(menu, MF_STRING, 6, L"Collapse all groups");
+    const UINT command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, app.window, nullptr);
+    DestroyMenu(menu);
+    if (command == 1 && row) { expansionState(app)[row->family] = !row->expanded; rebuild(app); }
+    if (command == 2 && row) copyText(app, row->process.name);
+    if (command == 3 && row) copyText(app, std::to_wstring(row->process.processId));
+    if (command == 4 && row) copyText(app, row->process.executable);
+    if (command == 5 || command == 6) expandAll(app, command == 5);
 }
 LRESULT CALLBACK processKeys(HWND window, UINT message, WPARAM wParam, LPARAM lParam, UINT_PTR, DWORD_PTR reference) {
     auto& app = *reinterpret_cast<App*>(reference);
@@ -484,7 +537,7 @@ bool createControls(App& app,HINSTANCE instance) {
     app.options=child(L"BUTTON",L"Settings",WS_TABSTOP|BS_PUSHBUTTON,optionsId);
     app.searchLabel=child(L"STATIC",L"&Search",0,0);
     app.search=child(L"EDIT",L"",WS_TABSTOP|ES_AUTOHSCROLL,searchId,WS_EX_CLIENTEDGE);
-    SendMessageW(app.search,EM_SETCUEBANNER,TRUE,reinterpret_cast<LPARAM>(L"Process name or PID"));
+    SendMessageW(app.search,EM_SETCUEBANNER,TRUE,reinterpret_cast<LPARAM>(L"App, process name or PID (Ctrl+F)"));
     app.table=child(WC_LISTVIEWW,L"Data",WS_TABSTOP|LVS_REPORT|LVS_OWNERDATA|LVS_SINGLESEL|LVS_SHOWSELALWAYS|LVS_SHAREIMAGELISTS,tableId,WS_EX_CLIENTEDGE);
     if(!app.tabs||!app.table||!app.search||!app.record||!app.options||!app.pause||!app.exportButton) return false;
     ListView_SetExtendedListViewStyle(app.table,LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER|LVS_EX_LABELTIP);
@@ -510,9 +563,12 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam
         if(!SetTimer(window,pollTimer,static_cast<UINT>(app->settings.pipeline.displayMs),nullptr)) return -1;
         return 0;
     case WM_TIMER: if(wParam==pollTimer) refresh(*app); return 0;
+    case WM_CONTEXTMENU:
+        if (reinterpret_cast<HWND>(wParam) == app->table) { processMenu(*app, lParam); return 0; }
+        break;
     case WM_COMMAND:
         switch(LOWORD(wParam)) {
-        case searchId: if(HIWORD(wParam)==EN_CHANGE&&app->table) rebuild(*app); break;
+        case searchId: if(HIWORD(wParam)==EN_CHANGE&&app->table) { app->searchExpansion.clear(); rebuild(*app); } break;
         case pauseId: app->paused=!app->paused; configure(*app); break;
         case exportId: exportRows(*app); break;
         case optionsId:
@@ -534,14 +590,17 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam
         } else if(notification->hwndFrom==app->table) {
             if (notification->code == NM_CUSTOMDRAW && app->settings.view == 1)
                 return drawProcess(*app, *reinterpret_cast<NMLVCUSTOMDRAW*>(lParam));
-            if (notification->code == NM_CLICK && app->settings.view == 1) {
+            if ((notification->code == NM_CLICK || notification->code == NM_DBLCLK) && app->settings.view == 1) {
                 const auto* click = reinterpret_cast<NMITEMACTIVATE*>(lParam);
-                if (click->iSubItem == 0) expandProcess(*app, click->iItem);
+                RECT bounds{};
+                if (click->iItem >= 0 && click->iSubItem == 0 && ListView_GetItemRect(app->table, click->iItem, &bounds, LVIR_BOUNDS)) {
+                    const bool arrow = click->ptAction.x >= bounds.left && click->ptAction.x < bounds.left + app->px(24);
+                    if ((notification->code == NM_CLICK && arrow) || (notification->code == NM_DBLCLK && !arrow))
+                        expandProcess(*app, click->iItem);
+                }
             } else if(notification->code==LVN_GETDISPINFOW) {
                 auto* info=reinterpret_cast<NMLVDISPINFOW*>(lParam);
-                if (info->item.mask & LVIF_IMAGE)
-                    info->item.iImage = app->settings.view == 1 && info->item.iItem >= 0 &&
-                        info->item.iItem < static_cast<int>(app->rowIcons.size()) ? app->rowIcons[info->item.iItem] : I_IMAGENONE;
+                if (info->item.mask & LVIF_IMAGE) info->item.iImage = I_IMAGENONE;
                 if((info->item.mask&LVIF_TEXT)&&info->item.iItem>=0&&info->item.iItem<static_cast<int>(app->textRows.size())&&
                     info->item.iSubItem>=0&&info->item.iSubItem<static_cast<int>(app->textRows[info->item.iItem].size()))
                     lstrcpynW(info->item.pszText,app->textRows[info->item.iItem][info->item.iSubItem].c_str(),info->item.cchTextMax);
@@ -565,7 +624,7 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam
         const UINT previous=app->dpi; app->dpi=HIWORD(wParam);
         const int count=Header_GetItemCount(ListView_GetHeader(app->table));
         for(int i=0;i<count;++i) ListView_SetColumnWidth(app->table,i,MulDiv(ListView_GetColumnWidth(app->table,i),static_cast<int>(app->dpi),static_cast<int>(previous)));
-        font(*app); updateIcons(*app); const auto* rect=reinterpret_cast<RECT*>(lParam);
+        font(*app); updateRowHeight(*app); const auto* rect=reinterpret_cast<RECT*>(lParam);
         SetWindowPos(window,nullptr,rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top,SWP_NOZORDER|SWP_NOACTIVATE); layout(*app); return 0;
     }
     case WM_ERASEBKGND: return 1;
@@ -584,6 +643,23 @@ LRESULT CALLBACK windowProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam
     }
     return DefWindowProcW(window,message,wParam,lParam);
 }
+}
+bool handleShortcut(App& app, const MSG& message) {
+    if (message.message != WM_KEYDOWN) return false;
+    if (message.wParam == 'F' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+        if (app.settings.view != 1) {
+            TabCtrl_SetCurSel(app.tabs, 1);
+            NMHDR notification{app.tabs, tabsId, TCN_SELCHANGE};
+            SendMessageW(app.window, WM_NOTIFY, tabsId, reinterpret_cast<LPARAM>(&notification));
+        }
+        SetFocus(app.search); SendMessageW(app.search, EM_SETSEL, 0, -1);
+        return true;
+    }
+    if (message.wParam == VK_ESCAPE && app.settings.view == 1 && !windowText(app.search).empty()) {
+        SetWindowTextW(app.search, L""); SetFocus(app.table);
+        return true;
+    }
+    return false;
 }
 int runGUI(HINSTANCE instance,int show) {
     INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_LISTVIEW_CLASSES|ICC_TAB_CLASSES|ICC_STANDARD_CLASSES};
@@ -607,6 +683,6 @@ int runGUI(HINSTANCE instance,int show) {
     ShowWindow(window,app.settings.maximized?SW_SHOWMAXIMIZED:show); UpdateWindow(window);
     MSG message{}; int result;
     while((result=static_cast<int>(GetMessageW(&message,nullptr,0,0)))>0)
-        if(!IsDialogMessageW(window,&message)) { TranslateMessage(&message); DispatchMessageW(&message); }
+        if(!handleShortcut(app,message)&&!IsDialogMessageW(window,&message)) { TranslateMessage(&message); DispatchMessageW(&message); }
     return result==-1?1:static_cast<int>(message.wParam);
 }
